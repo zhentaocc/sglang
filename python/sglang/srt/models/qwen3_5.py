@@ -29,7 +29,11 @@ from sglang.srt.configs.qwen3_5 import (
 )
 
 # Distributed
-from sglang.srt.distributed import get_pp_group, get_pp_indices
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_pp_indices,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
@@ -67,6 +71,66 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
+from sglang.srt.utils import get_bool_env_var
+
+# Env vars for qkv reshuffle and gate alt_stream
+_reshuffle_qkv_gate = get_bool_env_var("SGLANG_RESHUFFLE_QKV_GATE")
+_use_gate_alt_stream = get_bool_env_var("SGLANG_ATTN_GATE_ALT_STREAM")
+
+
+def _reshuffle_q_proj_weight_for_gated_attn(
+    weight: torch.Tensor, num_heads: int, head_dim: int
+) -> torch.Tensor:
+    """Reshuffle q_proj weight from [q0, gate0, q1, gate1, ...] to [q0, q1, ..., gate0, gate1, ...]."""
+    # weight: [num_heads*2*head_dim, hidden_size]
+    return (
+        weight.view(num_heads, 2, head_dim, -1)
+        .transpose(0, 1)
+        .reshape(-1, weight.shape[-1])
+    )
+
+
+def _reshuffle_qkv_proj_weight_q_k_v_gate(
+    weight: torch.Tensor,
+    q_size: int,
+    gate_size: int,
+    kv_size: int,
+    head_dim: int = 128,
+) -> torch.Tensor:
+    """Reshuffle qkv weight from [q_gate, k, v] to [q, k, v] (extract q, drop gate from qkv)."""
+    # weight: [q_size+gate_size+kv_size+kv_size, hidden_size]
+    # Layout: [q0(head_dim rows), g0(head_dim rows), q1, g1, ...] then k, v
+    q_gate_part = weight[: q_size + gate_size]
+    num_heads = (q_size + gate_size) // (2 * head_dim)
+    q_part = (
+        q_gate_part.view(num_heads, 2, head_dim, -1)
+        .transpose(0, 1)
+        .reshape(-1, q_gate_part.size(-1))[: num_heads * head_dim]
+    )
+    return torch.cat(
+        [q_part, weight[q_size + gate_size : q_size + gate_size + kv_size * 2]],
+        dim=0,
+    )
+
+
+def _split_q_proj_weight_for_gate_alt_stream(
+    weight: torch.Tensor, num_heads: int, head_dim: int, tp_size: int = 1
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Split q_proj weight (q+gate interleaved) into (q_weight, gate_weight).
+
+    TP handling: caller passes num_heads = total_heads // tp_size (per-shard).
+    - Presharded: weight rows == num_heads * 2 * head_dim.
+    - Full: weight rows == num_heads * tp_size * 2 * head_dim.
+    """
+    expected_shard = num_heads * 2 * head_dim
+    expected_full = num_heads * tp_size * 2 * head_dim
+    if weight.shape[0] == expected_full:
+        num_heads = num_heads * tp_size
+    elif weight.shape[0] != expected_shard:
+        num_heads = weight.shape[0] // (2 * head_dim)
+    w = weight.view(num_heads, 2, head_dim, -1).transpose(0, 1)
+    return tuple(x.reshape(num_heads * head_dim, -1) for x in w.unbind(0))
+
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
@@ -457,6 +521,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
 
+        self.use_gate_alt_stream = _use_gate_alt_stream and self.attn_output_gate
+        qkv_num_heads = (
+            self.total_num_heads  # qkv has q,k,v only (no gate)
+            if self.use_gate_alt_stream
+            else self.total_num_heads * (1 + self.attn_output_gate)
+        )
+
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
@@ -477,7 +548,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
-            self.total_num_heads * (1 + self.attn_output_gate),
+            qkv_num_heads,
             self.total_num_kv_heads,
             bias=False,
             quant_config=attn_quant_config,
@@ -485,6 +556,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
+
+        if self.use_gate_alt_stream:
+            self.gate_proj = ColumnParallelLinear(
+                config.hidden_size,
+                self.total_num_heads * self.head_dim,
+                bias=False,
+                gather_output=False,
+                quant_config=attn_quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("gate_proj", prefix),
+            )
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -590,7 +673,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         """Full attention forward pass."""
         qkv, _ = self.qkv_proj(hidden_states)
 
-        if self.attn_output_gate:
+        if self.use_gate_alt_stream:
+            # Launch gate_proj on alt_stream (runs in parallel with qk_norm, rope, attn)
+            if self.alt_stream is not None and get_is_capture_mode():
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    gate, _ = self.gate_proj(hidden_states)
+                # Don't wait here - let gate compute overlap with qk_norm, rope, attn
+            else:
+                gate, _ = self.gate_proj(hidden_states)
+
+        if self.attn_output_gate and not self.use_gate_alt_stream:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
             )
@@ -607,6 +701,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
+            if self.use_gate_alt_stream and self.alt_stream is not None and get_is_capture_mode():
+                torch.cuda.current_stream().wait_stream(self.alt_stream)
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
 
@@ -853,8 +949,43 @@ class Qwen3_5ForCausalLM(nn.Module):
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader")
-                weight_loader(param, loaded_weight, shard_id)
+
+                if (
+                    param_name == "qkv_proj"
+                    and weight_name == "q_proj"
+                    and _use_gate_alt_stream
+                ):
+                    tp_size = get_tensor_model_parallel_world_size()
+                    num_heads_per_shard = self.config.num_attention_heads // tp_size
+                    head_dim = getattr(
+                        self.config, "head_dim", None
+                    ) or self.config.hidden_size // self.config.num_attention_heads
+                    q_weight, gate_weight = _split_q_proj_weight_for_gate_alt_stream(
+                        loaded_weight, num_heads_per_shard, head_dim, tp_size
+                    )
+                    weight_loader = getattr(param, "weight_loader")
+                    weight_loader(param, q_weight, shard_id)
+                    gate_param_name = name.replace("qkv_proj", "gate_proj")
+                    # Model may use layers.N.self_attn.gate_proj; name has .self_attn removed
+                    gate_param_name_alt = gate_param_name.replace(
+                        ".gate_proj", ".self_attn.gate_proj"
+                    )
+                    for candidate in (gate_param_name, gate_param_name_alt):
+                        if candidate in params_dict:
+                            gate_param = params_dict[candidate]
+                            gate_weight_loader = getattr(
+                                gate_param, "weight_loader", default_weight_loader
+                            )
+                            gate_weight_loader(gate_param, gate_weight)
+                            break
+                    else:
+                        logger.warning(
+                            "gate_proj param not found for gate_alt_stream; "
+                            "gate_proj will be uninitialized"
+                        )
+                else:
+                    weight_loader = getattr(param, "weight_loader")
+                    weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.

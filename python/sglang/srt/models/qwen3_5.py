@@ -1133,6 +1133,15 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
     ) -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
+    def _get_num_fused_shared_experts(self):
+        if not (
+            hasattr(self.model, "layers")
+            and len(self.model.layers) > 0
+            and hasattr(self.model.layers[0].mlp, "num_fused_shared_experts")
+        ):
+            return 0
+        return self.model.layers[0].mlp.num_fused_shared_experts
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1143,13 +1152,17 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("gate_up_proj", "up_proj", 1),
         ]
 
+        num_experts_base = self.config.num_experts
+        num_fused_shared_experts = self._get_num_fused_shared_experts()
+        num_experts = num_experts_base + num_fused_shared_experts
+
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=num_experts,
         )
 
         # Skip loading extra parameters for GPTQ/modelopt models.
@@ -1171,8 +1184,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
-
-        num_experts = self.config.num_experts
 
         def load_fused_expert_weights(
             name: str,
@@ -1199,6 +1210,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
+            raw_weight_name = name
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
@@ -1446,6 +1458,15 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
 
+    def _get_num_fused_shared_experts(self):
+        if not (
+            hasattr(self.model, "layers")
+            and len(self.model.layers) > 0
+            and hasattr(self.model.layers[0].mlp, "num_fused_shared_experts")
+        ):
+            return 0
+        return self.model.layers[0].mlp.num_fused_shared_experts
+
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
@@ -1471,13 +1492,17 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("gate_up_proj", "up_proj", 1),
         ]
 
+        text_config = getattr(self.config, "text_config", self.config)
+        num_experts_base = text_config.num_experts
+        num_fused_shared_experts = self._get_num_fused_shared_experts()
+
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=num_experts_base + num_fused_shared_experts,
         )
 
         # Skip loading extra parameters for GPTQ/modelopt models.
@@ -1497,8 +1522,37 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
-
-        num_experts = self.config.num_experts
+        if num_fused_shared_experts > 0:
+            # Shared expert: checkpoint may use experts.512.gate_proj/up_proj/down_proj
+            # (separate) or experts.512.gate_up_proj (combined)
+            # param_name uses "experts.w13_" / "experts.w2_" so replace yields experts.w13_weight
+            fused_expert_params_mapping += [
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts_base}.gate_proj.",
+                    num_experts_base,
+                    "w1",
+                ),
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts_base}.up_proj.",
+                    num_experts_base,
+                    "w3",
+                ),
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts_base}.gate_up_proj.",
+                    num_experts_base,
+                    "w1",
+                ),
+                (
+                    "experts.w2_",
+                    f"experts.{num_experts_base}.down_proj.",
+                    num_experts_base,
+                    "w2",
+                ),
+            ]
+        num_experts = num_experts_base + num_fused_shared_experts
 
         def load_fused_expert_weights(
             name: str,
@@ -1525,6 +1579,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
+            raw_weight_name = name
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
@@ -1533,6 +1588,15 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+
+            # Remap shared expert to fused expert index when shared experts are fused
+            if num_fused_shared_experts > 0 and "mlp.shared_expert." in name:
+                # Only replace shared_expert submodule params (gate_up_proj, down_proj),
+                # not shared_expert_gate (which would incorrectly become experts.512_gate).
+                name = name.replace(
+                    "mlp.shared_expert.",
+                    f"mlp.experts.{num_experts_base}.",
+                )
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if name.endswith("experts.gate_up_proj") or name.endswith(
@@ -1589,23 +1653,33 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 params_dict,
                                 loaded_weight[0],
                                 "w1",
-                                num_experts,
+                                num_experts_base,
                             )
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
                                 loaded_weight[1],
                                 "w3",
-                                num_experts,
+                                num_experts_base,
                             )
-                        else:
+                        elif "experts.down_proj" in name:
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
                                 loaded_weight,
                                 shard_id,
-                                num_experts,
+                                num_experts_base,
                             )
+                        else:
+                            param = params_dict[name_mapped]
+                            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                            param = params_dict[name_mapped]
+                            if f"{num_experts_base}.gate_up_proj" in name:
+                                loaded_weight = loaded_weight.chunk(2, dim=-2)
+                                weight_loader(param, loaded_weight[0], name_mapped, "w1", expert_id)
+                                weight_loader(param, loaded_weight[1], name_mapped, "w3", expert_id)
+                            else:
+                                weight_loader(param, loaded_weight, name_mapped, shard_id, expert_id)
                     else:
                         # Skip loading extra parameters for GPTQ models.
                         if (

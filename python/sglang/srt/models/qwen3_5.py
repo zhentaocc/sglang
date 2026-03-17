@@ -77,7 +77,7 @@ from sglang.srt.utils import is_hip, get_bool_env_var
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_reshuffle_qkv_gate = _use_aiter
+_reshuffle_qkv_gate = _use_aiter # TODO: remove this after aiter is supported on other platforms, currently only supported on HIP
 
 
 def _reshuffle_qkv_proj_weight_to_q_k_v_gate(

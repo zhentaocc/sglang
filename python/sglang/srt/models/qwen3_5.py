@@ -1594,11 +1594,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         
         
         # Reshuffle qkv_proj weight to [q, k, v, gate] when enabled (full attention only)
+        logger.info(f"reshuffling qkv_proj weight to [q, k, v, gate]")
         for name, param in self.named_parameters(remove_duplicate=False):
             if (
-                param_name == "qkv_proj"
-                and weight_name == "v_proj"
+                "qkv_proj" in name
                 and "linear_attn" not in name
+                and "visual" not in name
                 and _reshuffle_qkv_gate
                 and getattr(self.config, "attn_output_gate", True)
             ):

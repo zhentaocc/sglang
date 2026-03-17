@@ -30,7 +30,11 @@ from sglang.srt.configs.qwen3_5 import (
 )
 
 # Distributed
-from sglang.srt.distributed import get_pp_group, get_pp_indices
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_pp_indices,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
@@ -69,6 +73,33 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
+from sglang.srt.utils import is_hip, get_bool_env_var
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_reshuffle_qkv_gate = _use_aiter
+
+
+def _reshuffle_qkv_proj_weight_to_q_k_v_gate(
+    weight: torch.Tensor,
+    q_size: int,
+    gate_size: int,
+    kv_size: int,
+    head_dim: int = 128,
+) -> torch.Tensor:
+    """Reshuffle qkv weight from [q_gate, k, v] to [q, k, v, gate].
+    Input layout: [q0, g0, q1, g1, ..., k, v]
+    Output layout: [q0, q1, ..., k, v, g0, g1, ...]
+    """
+    q_gate_part = weight[: q_size + gate_size]
+    kv_part = weight[q_size + gate_size : q_size + gate_size + kv_size * 2]
+    num_heads = (q_size + gate_size) // (2 * head_dim)
+    q_gate_2d = q_gate_part.view(num_heads, 2, head_dim, -1)
+    q_part = q_gate_2d[:, 0, :, :].reshape(q_size, -1)
+    gate_part = q_gate_2d[:, 1, :, :].reshape(gate_size, -1)
+    return torch.cat([q_part, kv_part, gate_part], dim=0)
+
+
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
@@ -720,18 +751,24 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
 
         if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
-            )
-            orig_shape = q_gate.shape[:-1]
-            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
-            q, gate = torch.chunk(q_gate, 2, dim=-1)
-            q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
-            qkv = torch.cat([q, k, v], dim=-1)
-        else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            qkv = qkv
+            if _reshuffle_qkv_gate:
+                # Layout [q, k, v, gate] (weight reshuffled at load)
+                qkv, gate = qkv.split(
+                    [self.q_size + self.kv_size + self.kv_size, self.q_size],
+                    dim=-1,
+                )
+            else:
+                # Interleaved [q_gate, k, v] layout
+                q_gate, k, v = qkv.split(
+                    [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+                )
+                orig_shape = q_gate.shape[:-1]
+                q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+                q, gate = torch.chunk(q_gate, 2, dim=-1)
+                q = q.reshape(*orig_shape, -1)
+                gate = gate.reshape(*orig_shape, -1)
+                qkv = torch.cat([q, k, v], dim=-1)
+
 
         save_kv_cache = True
         if (
@@ -743,6 +780,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
             save_kv_cache = False
         else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = self._apply_qk_norm(q, k)
             q, k = self.rotary_emb(positions, q, k)
 
@@ -1000,6 +1038,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
+
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1552,7 +1591,38 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
+        
+        
+        # Reshuffle qkv_proj weight to [q, k, v, gate] when enabled (full attention only)
+        for name, param in self.named_parameters(remove_duplicate=False):
+            if (
+                param_name == "qkv_proj"
+                and weight_name == "v_proj"
+                and "linear_attn" not in name
+                and _reshuffle_qkv_gate
+                and getattr(self.config, "attn_output_gate", True)
+            ):
+                head_dim = getattr(
+                    self.config, "head_dim", None
+                ) or self.config.hidden_size // self.config.num_attention_heads
 
+                tp_size = get_tensor_model_parallel_world_size()
+                num_heads = self.config.num_attention_heads // tp_size
+                num_kv_heads = max(
+                    1, self.config.num_key_value_heads // tp_size
+                )
+                q_size = num_heads * head_dim
+                gate_size = q_size
+                kv_size = num_kv_heads * head_dim
+                with torch.no_grad():
+                    w = param.weight.data
+                    param.weight.data = (
+                        _reshuffle_qkv_proj_weight_to_q_k_v_gate(
+                            w, q_size, gate_size, kv_size, head_dim
+                        )
+                        .to(w.dtype)
+                        .to(w.device)
+                    )
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()

@@ -438,7 +438,6 @@ class GemmaRMSNorm(MultiPlatformOp):
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
-
     def forward_aiter(
         self,
         x: torch.Tensor,

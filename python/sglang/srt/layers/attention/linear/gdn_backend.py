@@ -1,3 +1,4 @@
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -18,8 +19,10 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import rank0_log
+
+_use_aiter_conv = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
@@ -48,6 +51,11 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+elif _use_aiter_conv and os.getenv("SGLANG_CONV1D_UPDATE_IMPL", "aiter") == "aiter":
+    from sglang.srt.layers.attention.mamba.causal_conv1d_aiter import (
+        causal_conv1d_fn,
+        causal_conv1d_update,
+    )
 
 
 class GDNKernelDispatcher:
@@ -457,7 +465,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
             )
-
+            # Triton updates in-place; NPU/CPU return state. Copy back when kernel
+            # returns state so ssm_states is correct for next decode.
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False

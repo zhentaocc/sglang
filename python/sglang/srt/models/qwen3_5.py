@@ -707,6 +707,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 use_shuffle_layout=use_shuffle_layout,
                 block_size=block_size,
                 x=x,
+                rotary_dim=getattr(rotary_emb, "rotary_dim", head_size)
             )
         else:
             aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
@@ -734,6 +735,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 use_shuffle_layout=use_shuffle_layout,
                 block_size=block_size,
                 x=x,
+                rotary_dim=getattr(rotary_emb, "rotary_dim", head_size)
             )
 
         q_out = q_out.view(num_tokens, -1)

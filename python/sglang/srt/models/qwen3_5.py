@@ -1616,8 +1616,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 gate_size = q_size
                 kv_size = num_kv_heads * head_dim
                 with torch.no_grad():
-                    w = param.weight.data
-                    param.weight.data = (
+                    w = param.data
+                    param.data = (
                         _reshuffle_qkv_proj_weight_to_q_k_v_gate(
                             w, q_size, gate_size, kv_size, head_dim
                         )

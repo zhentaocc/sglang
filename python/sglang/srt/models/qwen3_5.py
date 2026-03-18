@@ -1594,36 +1594,36 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         
         
         # Reshuffle qkv_proj weight to [q, k, v, gate] when enabled (full attention only)
-        logger.info(f"reshuffling qkv_proj weight to [q, k, v, gate]")
-        for name, param in self.named_parameters(remove_duplicate=False):
-            if (
-                "qkv_proj" in name
-                and "linear_attn" not in name
-                and "visual" not in name
-                and _reshuffle_qkv_gate
-                and getattr(self.config, "attn_output_gate", True)
-            ):
-                head_dim = getattr(
-                    self.config, "head_dim", None
-                ) or self.config.hidden_size // self.config.num_attention_heads
+        if _reshuffle_qkv_gate:
+            logger.info(f"reshuffling qkv_proj weight to [q, k, v, gate]")
+            for name, param in self.named_parameters(remove_duplicate=False):
+                if (
+                    "qkv_proj" in name
+                    and "linear_attn" not in name
+                    and "visual" not in name
+                    and getattr(self.config, "attn_output_gate", True)
+                ):
+                    head_dim = getattr(
+                        self.config, "head_dim", None
+                    ) or self.config.hidden_size // self.config.num_attention_heads
 
-                tp_size = get_tensor_model_parallel_world_size()
-                num_heads = self.config.num_attention_heads // tp_size
-                num_kv_heads = max(
-                    1, self.config.num_key_value_heads // tp_size
-                )
-                q_size = num_heads * head_dim
-                gate_size = q_size
-                kv_size = num_kv_heads * head_dim
-                with torch.no_grad():
-                    w = param.data
-                    param.data = (
-                        _reshuffle_qkv_proj_weight_to_q_k_v_gate(
-                            w, q_size, gate_size, kv_size, head_dim
-                        )
-                        .to(w.dtype)
-                        .to(w.device)
+                    tp_size = get_tensor_model_parallel_world_size()
+                    num_heads = self.config.num_attention_heads // tp_size
+                    num_kv_heads = max(
+                        1, self.config.num_key_value_heads // tp_size
                     )
+                    q_size = num_heads * head_dim
+                    gate_size = q_size
+                    kv_size = num_kv_heads * head_dim
+                    with torch.no_grad():
+                        w = param.data
+                        param.data = (
+                            _reshuffle_qkv_proj_weight_to_q_k_v_gate(
+                                w, q_size, gate_size, kv_size, head_dim
+                            )
+                            .to(w.dtype)
+                            .to(w.device)
+                        )
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()

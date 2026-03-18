@@ -78,7 +78,6 @@ from sglang.srt.utils import (
     is_cuda,
     is_npu,
     make_layers,
-    rank0_log,
     set_weight_attrs,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -1013,7 +1012,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 if name not in params_dict:
                     continue
 
-                rank0_log(f"load_weights: {raw_weight_name} -> {name}")
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -1033,7 +1031,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     if is_fused_expert:
                         if "experts.gate_up_proj" in name:
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
-                            rank0_log(f"load_weights: {raw_weight_name} -> {name_mapped} (w1)")
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
@@ -1041,7 +1038,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                                 "w1",
                                 num_experts,
                             )
-                            rank0_log(f"load_weights: {raw_weight_name} -> {name_mapped} (w3)")
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
@@ -1050,7 +1046,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                                 num_experts,
                             )
                         else:
-                            rank0_log(f"load_weights: {raw_weight_name} -> {name_mapped}")
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
@@ -1065,7 +1060,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                             and name_mapped not in params_dict
                         ):
                             continue
-                        rank0_log(f"load_weights: {raw_weight_name} -> {name_mapped}")
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
@@ -1090,7 +1084,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                         continue
 
                     if name in params_dict.keys():
-                        rank0_log(f"load_weights: {raw_weight_name} -> {name}")
                         param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
@@ -1398,7 +1391,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 if name not in params_dict:
                     continue
 
-                rank0_log(f"load_weights: {raw_weight_name} -> {name}")
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -1427,7 +1419,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 "w1",
                                 num_experts_base,
                             )
-                            rank0_log(f"load_weights: {raw_weight_name}[0] -> {name_mapped} (w1) expert_id: {expert_id}")
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
@@ -1435,7 +1426,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 "w3",
                                 num_experts_base,
                             )
-                            rank0_log(f"load_weights: {raw_weight_name}[1] -> {name_mapped} (w3) expert_id: {expert_id}")
                         elif "experts.down_proj" in name:
                             load_fused_expert_weights(
                                 name_mapped,
@@ -1444,7 +1434,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 shard_id,
                                 num_experts_base,
                             )
-                            rank0_log(f"load_weights: {raw_weight_name} -> {name_mapped} ({shard_id}) expert_id: {expert_id}")
                         else:
                             param = params_dict[name_mapped]
                             weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -1452,12 +1441,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             if f"{num_experts_base}.gate_up_proj" in name:
                                 loaded_weight = loaded_weight.chunk(2, dim=-2)
                                 weight_loader(param, loaded_weight[0], name_mapped, "w1", expert_id)
-                                rank0_log(f"load_weights: {raw_weight_name}[0] -> {name_mapped} (w1) expert_id: {expert_id}")  
                                 weight_loader(param, loaded_weight[1], name_mapped, "w3", expert_id)
-                                rank0_log(f"load_weights: {raw_weight_name}[1] -> {name_mapped} (w3) expert_id: {expert_id}")
                             else:
                                 weight_loader(param, loaded_weight, name_mapped, shard_id, expert_id)
-                                rank0_log(f"load_weights: {raw_weight_name} -> {name_mapped} ({shard_id}) expert_id: {expert_id}")
                     else:
                         # Skip loading extra parameters for GPTQ models.
                         if (
@@ -1465,7 +1451,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             and name_mapped not in params_dict
                         ):
                             continue
-                        rank0_log(f"load_weights: {raw_weight_name} -> {name_mapped}")
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with

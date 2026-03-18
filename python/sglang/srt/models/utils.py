@@ -133,7 +133,8 @@ def enable_fused_qk_norm_rope_set_kv_aiter(forward_batch: ForwardBatch):
         get_global_server_args().enable_fused_qk_norm_rope
         and _use_aiter
         and enable_fused_set_kv_buffer_hip(forward_batch)
-        and get_bool_env_var("SGLANG_FUSED_QK_NORM_ROPE_CACHE_PTS_QUANT_SHUFFLE")
+        and get_bool_env_var("SGLANG_FUSED_QK_NORM_ROPE_CACHE_PTS_QUANT_SHUFFLE") 
+        # TODO: default to False if not set, and remove the default value from the env when aiter changes are included
     )
 
 

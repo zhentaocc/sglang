@@ -129,44 +129,66 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        # Split projection layers (following vLLM's implementation)
-        # Instead of fused in_proj_qkvz and in_proj_ba, use separate layers
-        self.in_proj_qkv = MergedColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_sizes=[self.key_dim, self.key_dim, self.value_dim],
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_qkv", prefix),
+        use_fused_in_proj = getattr(
+            config, "use_fused_linear_attn_in_proj", False
         )
-        self.in_proj_z = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=self.value_dim,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_z", prefix),
-        )
-        self.in_proj_b = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=self.num_v_heads,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_b", prefix),
-        )
-        self.in_proj_a = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=self.num_v_heads,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_a", prefix),
-        )
+        if use_fused_in_proj:
+            # Fused input projection: single linear for Q,K,V,Z,B,A
+            self.in_proj = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[
+                    self.key_dim,
+                    self.key_dim,
+                    self.value_dim,
+                    self.value_dim,
+                    self.num_v_heads,
+                    self.num_v_heads,
+                ],
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj", prefix),
+            )
+        else:
+            # Split projection layers (default)
+            self.in_proj_qkv = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[self.key_dim, self.key_dim, self.value_dim],
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_qkv", prefix),
+            )
+            self.in_proj_z = ColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_size=self.value_dim,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_z", prefix),
+            )
+            self.in_proj_b = ColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_size=self.num_v_heads,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_b", prefix),
+            )
+            self.in_proj_a = ColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_size=self.num_v_heads,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_a", prefix),
+            )
+        self.use_fused_in_proj = use_fused_in_proj
 
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
@@ -265,12 +287,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         seq_len, _ = hidden_states.shape
 
-        mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-        z, _ = self.in_proj_z(hidden_states)
+        if self.use_fused_in_proj:
+            proj_out, _ = self.in_proj(hidden_states)
+            qkv_size = (self.key_dim * 2 + self.value_dim) // self.attn_tp_size
+            z_size = self.value_dim // self.attn_tp_size
+            ba_size = self.num_v_heads // self.attn_tp_size
+            mixed_qkv, z, b, a = proj_out.split(
+                [qkv_size, z_size, ba_size, ba_size],
+                dim=-1,
+            )
+        else:
+            mixed_qkv, _ = self.in_proj_qkv(hidden_states)
+            z, _ = self.in_proj_z(hidden_states)
+            b, _ = self.in_proj_b(hidden_states)
+            a, _ = self.in_proj_a(hidden_states)
         z = z.reshape(z.size(0), -1, self.head_v_dim)
-        b, _ = self.in_proj_b(hidden_states)
-        a, _ = self.in_proj_a(hidden_states)
-
         b = b.contiguous()
         a = a.contiguous()
 
@@ -1201,6 +1232,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         prefix: str = "",
         language_model_cls=Qwen3_5MoeForCausalLM,
     ) -> None:
+        # Enable fused linear_attn in_proj (Q,K,V,Z,B,A) for this model only
+        config.text_config.use_fused_linear_attn_in_proj = True
         super().__init__(config, quant_config, prefix, language_model_cls)
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
@@ -1232,6 +1265,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+            # Fused linear_attn in_proj (Q,K,V,Z,B,A) - Qwen3_5MoeForConditionalGeneration only
+            ("in_proj", "in_proj_qkv.q_proj", 0),
+            ("in_proj", "in_proj_qkv.k_proj", 1),
+            ("in_proj", "in_proj_qkv.v_proj", 2),
+            ("in_proj", "in_proj_qkv", "split_qkv"),
+            ("in_proj", "in_proj_z", 3),
+            ("in_proj", "in_proj_b", 4),
+            ("in_proj", "in_proj_a", 5),
         ]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
@@ -1286,6 +1327,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        text_config = getattr(self.config, "text_config", self.config)
+        key_dim = (
+            text_config.linear_num_key_heads * text_config.linear_key_head_dim
+        )
+        value_dim = (
+            text_config.linear_num_value_heads * text_config.linear_value_head_dim
+        )
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -1318,6 +1366,28 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if "mlp.experts" in name:
                     continue
+
+                # in_proj_qkv (fused) -> in_proj: split to q,k,v and load
+                if shard_id == "split_qkv":
+                    if not name.endswith("in_proj_qkv.weight"):
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    if name not in params_dict:
+                        continue
+                    output_dim = 0
+                    q_part = loaded_weight.narrow(output_dim, 0, key_dim)
+                    k_part = loaded_weight.narrow(output_dim, key_dim, key_dim)
+                    v_part = loaded_weight.narrow(
+                        output_dim, 2 * key_dim, value_dim
+                    )
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader")
+                    weight_loader(param, q_part, 0)
+                    weight_loader(param, k_part, 1)
+                    weight_loader(param, v_part, 2)
+                    loaded_params.add(name)
+                    break
+
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:

@@ -132,7 +132,35 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         use_fused_in_proj = getattr(
             config, "use_fused_linear_attn_in_proj", False
         )
-        if use_fused_in_proj:
+        is_fp8_blockwise_linear_attn = getattr(
+            config, "is_fp8_blockwise_linear_attn", False
+        )
+        if use_fused_in_proj and is_fp8_blockwise_linear_attn:
+            # FP8 blockwise: merge QKV with Z, merge A with B (Qwen3_5MoeForConditionalGeneration only)
+            self.in_proj_qkvz = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[
+                    self.key_dim,
+                    self.key_dim,
+                    self.value_dim,
+                    self.value_dim,
+                ],
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_qkvz", prefix),
+            )
+            self.in_proj_ba = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[self.num_v_heads, self.num_v_heads],
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_ba", prefix),
+            )
+        elif use_fused_in_proj:
             # Fused input projection: single linear for Q,K,V,Z,B,A
             self.in_proj = MergedColumnParallelLinear(
                 input_size=self.hidden_size,
@@ -189,6 +217,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 prefix=add_prefix("in_proj_a", prefix),
             )
         self.use_fused_in_proj = use_fused_in_proj
+        self.is_fp8_blockwise_linear_attn = is_fp8_blockwise_linear_attn
 
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
@@ -287,7 +316,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         seq_len, _ = hidden_states.shape
 
-        if self.use_fused_in_proj:
+        if self.is_fp8_blockwise_linear_attn:
+            qkvz_out, _ = self.in_proj_qkvz(hidden_states)
+            ba_out, _ = self.in_proj_ba(hidden_states)
+            qkv_size = (self.key_dim * 2 + self.value_dim) // self.attn_tp_size
+            z_size = self.value_dim // self.attn_tp_size
+            ba_size = self.num_v_heads // self.attn_tp_size
+            mixed_qkv, z = qkvz_out.split([qkv_size, z_size], dim=-1)
+            b, a = ba_out.split([ba_size, ba_size], dim=-1)
+        elif self.use_fused_in_proj:
             proj_out, _ = self.in_proj(hidden_states)
             qkv_size = (self.key_dim * 2 + self.value_dim) // self.attn_tp_size
             z_size = self.value_dim // self.attn_tp_size
@@ -1234,6 +1271,15 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     ) -> None:
         # Enable fused linear_attn in_proj (Q,K,V,Z,B,A) for this model only
         config.text_config.use_fused_linear_attn_in_proj = True
+        # Only blockwise FP8 (fp8/mxfp8 with weight_block_size or use_mxfp8)
+        config.text_config.is_fp8_blockwise_linear_attn = (
+            quant_config is not None
+            and quant_config.get_name() in ("fp8", "mxfp8")
+            and (
+                getattr(quant_config, "use_mxfp8", False)
+                or getattr(quant_config, "weight_block_size", None) is not None
+            )
+        )
         super().__init__(config, quant_config, prefix, language_model_cls)
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
@@ -1265,15 +1311,30 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            # Fused linear_attn in_proj (Q,K,V,Z,B,A) - Qwen3_5MoeForConditionalGeneration only
-            ("in_proj", "in_proj_qkv.q_proj", 0),
-            ("in_proj", "in_proj_qkv.k_proj", 1),
-            ("in_proj", "in_proj_qkv.v_proj", 2),
-            ("in_proj", "in_proj_qkv", "split_qkv"),
-            ("in_proj", "in_proj_z", 3),
-            ("in_proj", "in_proj_b", 4),
-            ("in_proj", "in_proj_a", 5),
+
         ]
+
+        if self.config.text_config.is_fp8_blockwise_linear_attn:
+            # FP8 blockwise linear_attn: in_proj_qkvz (Q,K,V,Z), in_proj_ba (B,A)
+            stacked_params_mapping.extend([
+                ("in_proj_qkvz", "in_proj_qkv.q_proj", 0),
+                ("in_proj_qkvz", "in_proj_qkv.k_proj", 1),
+                ("in_proj_qkvz", "in_proj_qkv.v_proj", 2),
+                ("in_proj_qkvz", "in_proj_z", 3),
+                ("in_proj_ba", "in_proj_b", 0),
+                ("in_proj_ba", "in_proj_a", 1),
+            ])
+        else:
+            # Fused linear_attn in_proj (Q,K,V,Z,B,A) - Qwen3_5MoeForConditionalGeneration only
+            stacked_params_mapping.extend([
+                ("in_proj", "in_proj_qkv.q_proj", 0),
+                ("in_proj", "in_proj_qkv.k_proj", 1),
+                ("in_proj", "in_proj_qkv.v_proj", 2),
+                ("in_proj", "in_proj_qkv", "split_qkv"),
+                ("in_proj", "in_proj_z", 3),
+                ("in_proj", "in_proj_b", 4),
+                ("in_proj", "in_proj_a", 5),
+            ])
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)

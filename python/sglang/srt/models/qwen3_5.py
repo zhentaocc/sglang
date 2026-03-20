@@ -1516,7 +1516,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         ]
 
-        if self.config.text_config.is_fp8_blockwise_linear_attn:
+        text_config = getattr(self.config, "text_config", self.config)
+        is_fp8_blockwise_linear_attn = getattr(
+            text_config, "is_fp8_blockwise_linear_attn", False
+        )
+        if is_fp8_blockwise_linear_attn:
             # FP8 blockwise linear_attn: in_proj_qkvz (Q,K,V,Z), in_proj_ba (B,A)
             stacked_params_mapping.extend([
                 ("in_proj_qkvz", "in_proj_qkv.q_proj", 0),
@@ -1538,7 +1542,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 ("in_proj", "in_proj_a", 5),
             ])
 
-        text_config = getattr(self.config, "text_config", self.config)
         num_experts_base = text_config.num_experts
         num_fused_shared_experts = self._get_num_fused_shared_experts()
 

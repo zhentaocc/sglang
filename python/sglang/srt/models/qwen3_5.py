@@ -100,6 +100,45 @@ def _reshuffle_qkv_proj_weight_to_q_k_v_gate(
     return torch.cat([q_part, kv_part, gate_part], dim=0)
 
 
+def _reshuffle_qkv_proj_scale_to_q_k_v_gate(
+    scale: torch.Tensor,
+    q_size: int,
+    gate_size: int,
+    kv_size: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Reshuffle qkv weight scale from [q_gate, k, v] to [q, k, v, gate].
+    Handles: (1) per-partition 1D scale [3]; (2) 2D block scale [out_blocks, in_blocks].
+    """
+    out_features = q_size + gate_size + kv_size * 2
+    if scale.ndim == 1 and scale.shape[0] == 3:
+        # Per-partition: [q_gate, k, v] -> [q, k, v, gate]; q and gate share scale
+        return torch.stack([scale[0], scale[1], scale[2], scale[0]])
+    if scale.ndim == 2:
+        # Block scale: apply same row permutation as weight
+        out_blocks = scale.shape[0]
+        block_n = max(1, (out_features + out_blocks - 1) // out_blocks)
+        num_heads = (q_size + gate_size) // (2 * head_dim)
+        perm = []
+        for i in range(num_heads):
+            perm.extend(range(i * 2 * head_dim, i * 2 * head_dim + head_dim))
+        perm.extend(range(q_size + gate_size, q_size + gate_size + kv_size))
+        perm.extend(range(q_size + gate_size + kv_size, q_size + gate_size + 2 * kv_size))
+        for i in range(num_heads):
+            perm.extend(
+                range(i * 2 * head_dim + head_dim, (i + 1) * 2 * head_dim)
+            )
+        scale_perm = [
+            min(
+                perm[min(j * block_n, out_features - 1)] // block_n,
+                out_blocks - 1,
+            )
+            for j in range(out_blocks)
+        ]
+        return scale[scale_perm, :].contiguous()
+    return scale
+
+
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
@@ -1804,37 +1843,64 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             loaded_params.add(name)
         
         
-        # Reshuffle qkv_proj weight to [q, k, v, gate] when enabled (full attention only)
+        # Reshuffle qkv_proj weight (and FP8 scales) to [q, k, v, gate] when enabled (full attention only)
         if _reshuffle_qkv_gate:
             logger.info(f"reshuffling qkv_proj weight to [q, k, v, gate]")
-            for name, param in self.named_parameters(remove_duplicate=False):
+            text_config = getattr(self.config, "text_config", self.config)
+            tp_size = get_tensor_model_parallel_world_size()
+            num_heads = text_config.num_attention_heads // tp_size
+            num_kv_heads = max(
+                1, text_config.num_key_value_heads // tp_size
+            )
+            params_dict = dict(self.named_parameters(remove_duplicate=False))
+            for name, param in params_dict.items():
                 if (
                     "qkv_proj" in name
                     and "linear_attn" not in name
                     and "visual" not in name
                     and getattr(self.config, "attn_output_gate", True)
                 ):
-                    head_dim = getattr(
-                        self.config, "head_dim", None
-                    ) or self.config.hidden_size // self.config.num_attention_heads
-
-                    tp_size = get_tensor_model_parallel_world_size()
-                    num_heads = self.config.num_attention_heads // tp_size
-                    num_kv_heads = max(
-                        1, self.config.num_key_value_heads // tp_size
-                    )
-                    q_size = num_heads * head_dim
-                    gate_size = q_size
-                    kv_size = num_kv_heads * head_dim
-                    with torch.no_grad():
-                        w = param.data
-                        param.data = (
-                            _reshuffle_qkv_proj_weight_to_q_k_v_gate(
-                                w, q_size, gate_size, kv_size, head_dim
-                            )
-                            .to(w.dtype)
-                            .to(w.device)
+                    # Infer head_dim from weight shape (handles config mismatches, e.g. FP8)
+                    if name.endswith(".weight"):
+                        out_features = param.data.shape[0]
+                        head_dim = out_features // (
+                            2 * (num_heads + num_kv_heads)
                         )
+                        q_size = num_heads * head_dim
+                        gate_size = q_size
+                        kv_size = num_kv_heads * head_dim
+                        with torch.no_grad():
+                            w = param.data
+                            param.data = (
+                                _reshuffle_qkv_proj_weight_to_q_k_v_gate(
+                                    w, q_size, gate_size, kv_size, head_dim
+                                )
+                                .to(w.dtype)
+                                .to(w.device)
+                            )
+                    elif "weight_scale" in name or "weight_scale_inv" in name:
+                        # Reshuffle FP8 scale to match weight layout
+                        weight_name = name.replace(
+                            "weight_scale_inv", "weight"
+                        ).replace("weight_scale", "weight")
+                        weight_param = params_dict.get(weight_name)
+                        if weight_param is not None:
+                            out_features = weight_param.data.shape[0]
+                            head_dim = out_features // (
+                                2 * (num_heads + num_kv_heads)
+                            )
+                            q_size = num_heads * head_dim
+                            gate_size = q_size
+                            kv_size = num_kv_heads * head_dim
+                            with torch.no_grad():
+                                s = param.data
+                                param.data = (
+                                    _reshuffle_qkv_proj_scale_to_q_k_v_gate(
+                                        s, q_size, gate_size, kv_size, head_dim
+                                    )
+                                    .to(s.dtype)
+                                    .to(s.device)
+                                )
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()
